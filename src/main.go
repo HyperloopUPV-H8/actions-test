@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"path"
@@ -14,14 +15,18 @@ import (
 	"github.com/HyperloopUPV-H8/Backend-H8/common"
 	"github.com/HyperloopUPV-H8/Backend-H8/connection_transfer"
 	"github.com/HyperloopUPV-H8/Backend-H8/data_transfer"
-	"github.com/HyperloopUPV-H8/Backend-H8/excel_adapter"
+	"github.com/HyperloopUPV-H8/Backend-H8/excel"
+	"github.com/HyperloopUPV-H8/Backend-H8/excel/ade"
+	"github.com/HyperloopUPV-H8/Backend-H8/info"
 	"github.com/HyperloopUPV-H8/Backend-H8/logger_handler"
 	protection_logger "github.com/HyperloopUPV-H8/Backend-H8/message_logger"
 	"github.com/HyperloopUPV-H8/Backend-H8/message_transfer"
 	"github.com/HyperloopUPV-H8/Backend-H8/order_logger"
 	"github.com/HyperloopUPV-H8/Backend-H8/order_transfer"
 	"github.com/HyperloopUPV-H8/Backend-H8/packet_logger"
+	"github.com/HyperloopUPV-H8/Backend-H8/pod_data"
 	"github.com/HyperloopUPV-H8/Backend-H8/server"
+	"github.com/HyperloopUPV-H8/Backend-H8/state_space_logger"
 	"github.com/HyperloopUPV-H8/Backend-H8/update_factory"
 	"github.com/HyperloopUPV-H8/Backend-H8/value_logger"
 	"github.com/HyperloopUPV-H8/Backend-H8/vehicle"
@@ -51,9 +56,35 @@ func main() {
 
 	config := getConfig("./config.toml")
 
-	excelAdapter := excel_adapter.New(config.Excel)
-	boards := excelAdapter.GetBoards()
-	globalInfo := excelAdapter.GetGlobalInfo()
+	// excelAdapter := excel_adapter.New(config.Excel)
+	// boards := excelAdapter.GetBoards()
+	// globalInfo := excelAdapter.GetGlobalInfo()
+
+	file, err := excel.Download(excel.DownloadConfig(config.Excel.Download))
+
+	if err != nil {
+		trace.Fatal().Err(err).Msg("downloading file")
+	}
+
+	ade, err := ade.CreateADE(file)
+
+	if err != nil {
+		trace.Fatal().Err(err).Msg("creating ade")
+	}
+
+	info, err := info.NewInfo(ade.Info)
+
+	if err != nil {
+		trace.Fatal().Err(err).Msg("creating info")
+	}
+
+	podData, err := pod_data.NewPodData(ade.Boards, info.Units)
+
+	if err != nil {
+		trace.Fatal().Err(err).Msg("creating podData")
+	}
+
+	dataOnlyPodData := pod_data.GetDataOnlyPodData(podData)
 
 	dev, err := selectDev()
 	if err != nil {
@@ -64,24 +95,37 @@ func main() {
 
 	connectionTransfer := connection_transfer.New(config.Connections)
 
-	podData := vehicle_models.NewPodData(boards)
-	vehicleOrders := vehicle_models.NewVehicleOrders(boards, config.Excel.Parse.Global.BLCUAddressKey)
+	vehicleOrders, err := vehicle_models.NewVehicleOrders(podData.Boards, config.Excel.Parse.Global.BLCUAddressKey)
+
+	if err != nil {
+		trace.Fatal().Err(err).Msg("creating vehicleOrders")
+	}
 
 	vehicle := vehicle.New(vehicle.VehicleConstructorArgs{
 		Config:             config.Vehicle,
-		Boards:             boards,
-		GlobalInfo:         globalInfo,
+		Boards:             podData.Boards,
+		Info:               info,
 		OnConnectionChange: connectionTransfer.Update,
 	})
 
-	blcu := blcuPackage.NewBLCU(globalInfo, config.BLCU)
-	blcu.SetSendOrder(vehicle.SendOrder)
+	var blcu blcuPackage.BLCU
+	blcuAddr, useBlcu := info.Addresses.Boards["BLCU"]
+
+	if useBlcu {
+		blcu = blcuPackage.NewBLCU(net.TCPAddr{
+			IP:   blcuAddr,
+			Port: int(info.Ports.TcpServer),
+		}, info.BoardIds, config.BLCU)
+
+		blcu.SetSendOrder(vehicle.SendOrder)
+	}
 
 	vehicleUpdates := make(chan vehicle_models.PacketUpdate, 1)
 	vehicleProtections := make(chan any)
 	vehicleTransmittedOrders := make(chan vehicle_models.PacketUpdate)
 	blcuAckChan := make(chan struct{})
 	stateOrdersChan := make(chan message_parser.StateOrdersAdapter)
+	stateSpaceChan := make(chan vehicle_models.StateSpace)
 
 	dataTransfer := data_transfer.New(config.DataTransfer)
 	go dataTransfer.Run()
@@ -89,16 +133,18 @@ func main() {
 	messageTransfer := message_transfer.New(config.Messages)
 	orderTransfer, orderChannel := order_transfer.New()
 
-	packetLogger := packet_logger.NewPacketLogger(boards, config.PacketLogger)
-	valueLogger := value_logger.NewValueLogger(boards, config.ValueLogger)
-	orderLogger := order_logger.NewOrderLogger(boards, config.OrderLogger)
+	packetLogger := packet_logger.NewPacketLogger(podData.Boards, config.PacketLogger)
+	valueLogger := value_logger.NewValueLogger(podData.Boards, config.ValueLogger)
+	orderLogger := order_logger.NewOrderLogger(podData.Boards, config.OrderLogger)
 	protectionLogger := protection_logger.NewMessageLogger(config.Vehicle.Messages.InfoIdKey, config.Vehicle.Messages.FaultIdKey, config.Vehicle.Messages.WarningIdKey, config.ProtectionLogger)
+	stateSpaceLogger := state_space_logger.NewStateSpaceLogger(info.MessageIds.StateSpace)
 
 	loggers := map[string]logger_handler.Logger{
 		"packets":     &packetLogger,
 		"values":      &valueLogger,
 		"orders":      &orderLogger,
 		"protections": &protectionLogger,
+		"stateSpace":  &stateSpaceLogger,
 	}
 
 	loggerHandler := logger_handler.NewLoggerHandler(loggers, config.LoggerHandler)
@@ -106,14 +152,17 @@ func main() {
 	websocketBroker := websocket_broker.New()
 	defer websocketBroker.Close()
 
-	websocketBroker.RegisterHandle(&blcu, config.BLCU.Topics.Upload, config.BLCU.Topics.Download)
+	if useBlcu {
+		websocketBroker.RegisterHandle(&blcu, config.BLCU.Topics.Upload, config.BLCU.Topics.Download)
+	}
+
 	websocketBroker.RegisterHandle(&connectionTransfer, config.Connections.UpdateTopic, "connection/update")
 	websocketBroker.RegisterHandle(&dataTransfer, "podData/update")
 	websocketBroker.RegisterHandle(&loggerHandler, config.LoggerHandler.Topics.Enable)
 	websocketBroker.RegisterHandle(&messageTransfer, "message/update")
 	websocketBroker.RegisterHandle(&orderTransfer, config.Orders.SendTopic, "order/stateOrders")
 
-	go vehicle.Listen(vehicleUpdates, vehicleTransmittedOrders, vehicleProtections, blcuAckChan, stateOrdersChan)
+	go vehicle.Listen(vehicleUpdates, vehicleTransmittedOrders, vehicleProtections, blcuAckChan, stateOrdersChan, stateSpaceChan)
 
 	go startPacketUpdateRoutine(vehicleUpdates, &dataTransfer, &loggerHandler)
 	go startMessagesRoutine(vehicleProtections, &messageTransfer, &loggerHandler)
@@ -126,9 +175,20 @@ func main() {
 		}
 	}()
 
+	if useBlcu {
+		go func() {
+			for range blcuAckChan {
+				blcu.NotifyAck()
+			}
+		}()
+	}
+
 	go func() {
-		for range blcuAckChan {
-			blcu.NotifyAck()
+		for stateSpace := range stateSpaceChan {
+			for _, row := range stateSpace {
+				loggerHandler.Log(state_space_logger.LoggableStateSpaceRow(row))
+			}
+
 		}
 	}()
 
@@ -143,12 +203,12 @@ func main() {
 		}
 	}()
 
-	uploadableBords := common.Filter(common.Keys(globalInfo.BoardToIP), func(item string) bool {
+	uploadableBords := common.Filter(common.Keys(info.Addresses.Boards), func(item string) bool {
 		return item != config.Excel.Parse.Global.BLCUAddressKey
 	})
 
 	endpointData := server.EndpointData{
-		PodData:           podData,
+		PodData:           dataOnlyPodData,
 		OrderData:         vehicleOrders,
 		ProgramableBoards: uploadableBords,
 	}

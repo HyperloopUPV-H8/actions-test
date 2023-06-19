@@ -4,11 +4,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
 	"github.com/HyperloopUPV-H8/Backend-H8/common"
-	excel_models "github.com/HyperloopUPV-H8/Backend-H8/excel_adapter/models"
+	"github.com/HyperloopUPV-H8/Backend-H8/info"
 	"github.com/HyperloopUPV-H8/Backend-H8/packet"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -22,12 +23,13 @@ const SNAPLEN = 1500
 type Sniffer struct {
 	source *pcap.Handle
 	filter string
+	config Config
 	trace  zerolog.Logger
 }
 
-func CreateSniffer(global excel_models.GlobalInfo, config Config, trace zerolog.Logger) Sniffer {
-	ips := common.Values(global.BoardToIP)
-	filter := getFilter(ips, global.ProtocolToPort, config.TcpClientTag, config.TcpServerTag, config.UdpTag)
+func CreateSniffer(info info.Info, config Config, trace zerolog.Logger) Sniffer {
+	ips := common.Values(info.Addresses.Boards)
+	filter := getFilter(ips, info.Ports.UDP, info.Ports.TcpClient, info.Ports.TcpServer)
 	sniffer, err := newSniffer(filter, config)
 
 	if err != nil {
@@ -39,8 +41,8 @@ func CreateSniffer(global excel_models.GlobalInfo, config Config, trace zerolog.
 
 func newSniffer(filter string, config Config) (*Sniffer, error) {
 	trace.Info().Msg("new sniffer")
+	source, err := newSource(config, filter)
 
-	source, err := obtainSource(config.Interface, filter, config.Mtu)
 	if err != nil {
 		trace.Error().Stack().Err(err).Msg("")
 		return nil, err
@@ -49,17 +51,28 @@ func newSniffer(filter string, config Config) (*Sniffer, error) {
 	return &Sniffer{
 		source: source,
 		filter: filter,
+		config: config,
 		trace:  trace.With().Str("component", "sniffer").Str("dev", config.Interface).Logger(),
 	}, nil
 }
 
-func getFilter(addrs []string, protocolToPort map[string]string, tcpClientTag string, tcpServerTag string, udpTag string) string {
+func newSource(config Config, filter string) (*pcap.Handle, error) {
+	source, err := obtainSource(config.Interface, filter, config.Mtu)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return source, nil
+}
+
+func getFilter(addrs []net.IP, udpPort uint16, tcpClientPort uint16, tcpServerPort uint16) string {
 	ipipFilter := getIPIPfilter()
-	udpFilter := getUDPFilter(addrs, protocolToPort, udpTag)
-	tcpFilter := getTCPFilter(addrs, protocolToPort, tcpClientTag, tcpServerTag)
+	udpFilter := getUDPFilter(addrs, udpPort)
+	tcpFilter := getTCPFilter(addrs, tcpServerPort, tcpClientPort)
 	filter := fmt.Sprintf("(%s) or (%s) or (%s)", ipipFilter, udpFilter, tcpFilter)
 
-	trace.Trace().Strs("addrs", addrs).Str("filter", filter).Msg("new filter")
+	trace.Trace().Any("addrs", addrs).Str("filter", filter).Msg("new filter")
 	return filter
 }
 
@@ -67,18 +80,18 @@ func getIPIPfilter() string {
 	return "ip[9] == 4"
 }
 
-func getUDPFilter(addrs []string, protocolToPort map[string]string, udpTag string) string {
-	udp := fmt.Sprintf("(udp port %s)", protocolToPort[udpTag])
+func getUDPFilter(addrs []net.IP, port uint16) string {
+	udp := fmt.Sprintf("(udp port %d)", port)
 	udpAddr := ""
 	for _, addr := range addrs {
-		udpAddr = fmt.Sprintf("%s or (src host %s)", udpAddr, addr)
+		udpAddr = fmt.Sprintf("%s or (src host %s)", udpAddr, addr.String())
 	}
 	udpAddr = strings.TrimPrefix(udpAddr, " or ")
 	return fmt.Sprintf("%s and (%s)", udp, udpAddr)
 }
 
-func getTCPFilter(addrs []string, protocolToPort map[string]string, tcpClientTag string, tcpServerTag string) string {
-	ports := fmt.Sprintf("tcp port %s or %s", protocolToPort[tcpClientTag], protocolToPort[tcpServerTag])
+func getTCPFilter(addrs []net.IP, serverPort uint16, clientPort uint16) string {
+	ports := fmt.Sprintf("tcp port %d or %d", serverPort, clientPort)
 	flags := "tcp[tcpflags] & (tcp-fin | tcp-syn | tcp-rst) == 0"
 	nonZeroPayload := "tcp[tcpflags] & tcp-push != 0"
 
@@ -86,8 +99,8 @@ func getTCPFilter(addrs []string, protocolToPort map[string]string, tcpClientTag
 	dstAddresses := make([]string, 0, len(addrs))
 
 	for _, addr := range addrs {
-		srcAddresses = append(srcAddresses, fmt.Sprintf("(src host %s)", addr))
-		dstAddresses = append(dstAddresses, fmt.Sprintf("(dst host %s)", addr))
+		srcAddresses = append(srcAddresses, fmt.Sprintf("(src host %s)", addr.String()))
+		dstAddresses = append(dstAddresses, fmt.Sprintf("(dst host %s)", addr.String()))
 	}
 
 	srcAddrsStr := strings.Join(srcAddresses, " or ")
@@ -113,9 +126,20 @@ func obtainSource(dev string, filter string, mtu uint) (*pcap.Handle, error) {
 }
 
 func (sniffer *Sniffer) Listen(output chan<- packet.Packet) {
-	sniffer.trace.Info().Msg("start listening")
+	go sniffer.startReadLoop(output)
+}
 
-	go sniffer.read(output)
+func (sniffer *Sniffer) startReadLoop(output chan<- packet.Packet) {
+	for {
+		source, err := newSource(sniffer.config, sniffer.filter)
+		if err != nil {
+			continue
+		}
+		sniffer.source = source
+
+		sniffer.trace.Info().Msg("start listening")
+		sniffer.read(output)
+	}
 
 }
 

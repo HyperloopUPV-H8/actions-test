@@ -1,9 +1,8 @@
 package ade
 
 import (
-	"errors"
-
-	doc "github.com/HyperloopUPV-H8/Backend-H8/excel/document"
+	"github.com/HyperloopUPV-H8/Backend-H8/common"
+	"github.com/HyperloopUPV-H8/Backend-H8/excel/document"
 	"github.com/xuri/excelize/v2"
 )
 
@@ -12,24 +11,40 @@ const (
 )
 
 func CreateADE(file *excelize.File) (ADE, error) {
-	document := doc.CreateDocument(file)
-	infoSheet, ok := document.Sheets[InfoName]
-
-	if !ok {
-		return ADE{}, errors.New("info sheet not found")
-	}
-
-	info, err := getInfo(infoSheet)
+	doc, err := document.CreateDocument(file)
 
 	if err != nil {
 		return ADE{}, err
 	}
+	adeErrors := common.NewErrorList()
 
-	boardSheets := FilterMap(document.Sheets, func(name string, _ doc.Sheet) bool {
+	info, err := getInfo(doc)
+
+	if err != nil {
+		adeErrors.Add(err)
+	}
+
+	boardSheets := FilterMap(doc.Sheets, func(name string, _ document.Sheet) bool {
 		return name != InfoName
 	})
 
-	boards := getBoards(boardSheets)
+	boards, err := getBoards(boardSheets)
+
+	if err != nil {
+		adeErrors.Add(err)
+	}
+
+	if len(adeErrors) > 0 {
+		return ADE{}, adeErrors
+	}
+
+	if err != nil {
+		adeErrors.Add(err)
+	}
+
+	if len(adeErrors) > 0 {
+		return ADE{}, adeErrors
+	}
 
 	return ADE{
 		Info:   info,

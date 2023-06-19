@@ -1,4 +1,4 @@
-package models
+package pod_data
 
 import "sort"
 
@@ -9,7 +9,7 @@ func (packets SortablePacket) Len() int {
 }
 
 func (packets SortablePacket) Less(i, j int) bool {
-	return int(packets[i].ID) < int(packets[j].ID)
+	return int(packets[i].Id) < int(packets[j].Id)
 }
 
 func (packets SortablePacket) Swap(i, j int) {
