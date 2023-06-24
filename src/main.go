@@ -32,7 +32,7 @@ import (
 	"github.com/HyperloopUPV-H8/Backend-H8/vehicle"
 	"github.com/HyperloopUPV-H8/Backend-H8/vehicle/message_parser"
 	vehicle_models "github.com/HyperloopUPV-H8/Backend-H8/vehicle/models"
-	"github.com/HyperloopUPV-H8/Backend-H8/websocket_broker"
+	"github.com/HyperloopUPV-H8/Backend-H8/ws_handle"
 	"github.com/fatih/color"
 	"github.com/google/gopacket/pcap"
 	"github.com/pelletier/go-toml/v2"
@@ -101,11 +101,19 @@ func main() {
 		trace.Fatal().Err(err).Msg("creating vehicleOrders")
 	}
 
+	orderTransfer, orderChannel := order_transfer.New()
+
 	vehicle := vehicle.New(vehicle.VehicleConstructorArgs{
-		Config:             config.Vehicle,
-		Boards:             podData.Boards,
-		Info:               info,
-		OnConnectionChange: connectionTransfer.Update,
+		PodData: podData,
+		Config:  config.Vehicle,
+		Boards:  podData.Boards,
+		Info:    info,
+		OnConnectionChange: func(board string, isConnected bool) {
+			if !isConnected {
+				orderTransfer.ClearOrders(board)
+			}
+			connectionTransfer.Update(board, isConnected)
+		},
 	})
 
 	var blcu blcuPackage.BLCU
@@ -131,7 +139,6 @@ func main() {
 	go dataTransfer.Run()
 
 	messageTransfer := message_transfer.New(config.Messages)
-	orderTransfer, orderChannel := order_transfer.New()
 
 	packetLogger := packet_logger.NewPacketLogger(podData.Boards, config.PacketLogger)
 	valueLogger := value_logger.NewValueLogger(podData.Boards, config.ValueLogger)
@@ -149,7 +156,7 @@ func main() {
 
 	loggerHandler := logger_handler.NewLoggerHandler(loggers, config.LoggerHandler)
 
-	websocketBroker := websocket_broker.New()
+	websocketBroker := ws_handle.New()
 	defer websocketBroker.Close()
 
 	if useBlcu {

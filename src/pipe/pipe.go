@@ -65,6 +65,7 @@ func (pipe *Pipe) open(conn *net.TCPConn) {
 	pipe.trace.Debug().Msg("open")
 	pipe.conn = conn
 	pipe.isClosed = false
+	pipe.conn.SetNoDelay(true)
 	pipe.onConnectionChange(!pipe.isClosed)
 }
 
@@ -120,6 +121,14 @@ func (pipe *Pipe) getRaw(payload []byte) packet.Packet {
 		Metadata: packet.NewMetaData(pipe.raddr.String(), pipe.laddr.String(), binary.LittleEndian.Uint16(payload[0:2]), syntheticSeqNum, time.Now()),
 		Payload:  payload[2:],
 	}
+}
+
+func (pipe *Pipe) SendFault(from string, payload []byte) {
+	if from == pipe.raddr.String() {
+		return
+	}
+
+	pipe.Write(append([]byte{0x02, 0x00}, payload...))
 }
 
 func (pipe *Pipe) Write(data []byte) (int, error) {
